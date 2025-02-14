@@ -8,6 +8,7 @@ Rustの手続き型マクロを学ぶのに[Rust Latam: procedural macros worksh
   - [手続き型マクロの仕組み](#手続き型マクロの仕組み)
   - [戻り値のTokenStreamの作成](#戻り値のtokenstreamの作成)
   - [入力のTokenStreamの解析](#入力のtokenstreamの解析)
+  - [エラーハンドリング](#エラーハンドリング)
 
 ## はじめに
 
@@ -26,7 +27,7 @@ cd hello-proc-macro
 proc-macro = true
 ```
 
-手続き型マクロを書くのに必須ではないがほぼ必須と言ってよい3つのクレートがあるので追加します。各クレートの説明は使用時に行います。
+手続き型マクロを書くのにほぼ必須と言ってよい3つのクレートがあるので追加します。各クレートの説明は使用時に行います。
 ```shell
 cargo add syn --features full,extra-traits
 cargo add quote
@@ -49,7 +50,7 @@ error: `proc-macro` crate types currently cannot export any items other than fun
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ```
 
-代わりに`src/lib.rs`に下記の内容を書きます。ワークショップの`lib.rs`とほぼ同じコードです。
+代わりに`src/lib.rs`に下記の内容を書きます。ワークショップの`lib.rs`と同じコードです。
 ```rust
 use proc_macro::TokenStream;
 
@@ -393,7 +394,7 @@ lvs7k@wsl2:~/hello-proc-macro$ cargo check
 
 </details>
 
-あとはここから必要な情報を取り出して、`quote!`マクロを使って戻り値の`TokenStream`を作成するだけです😊例として`Command`構造体の`arg`というフィールドを取り出してみましょう。通常のRustコードを書くときと同様に、パターンマッチをしていきます。
+あとはここから必要な情報を取り出して、`quote!`マクロを使って戻り値の`TokenStream`を作成するだけです😊例として`Command`構造体からフィールド名を取り出してみましょう。通常のRustコードを書くときと同様に、パターンマッチをしていきます。
 
 ```rust
 use proc_macro::TokenStream;
@@ -428,3 +429,143 @@ pub fn derive(input: TokenStream) -> TokenStream {
     ret.into()
 }
 ```
+
+> [!WARNING]
+> 上記のコードではパターンマッチに失敗したときに`panic!`していますが、これは正しいエラーハンドリングではありません。
+
+`fields`変数の型は`Vec<&syn::Ident>`です。`quote!`マクロでは`#(...)*`という構文により、`Iterator`の要素ごとにマクロを展開することができます。「あれ、なんか出力結果がおかしいな」と思ったら上記のコードのように戻り値の`TokenStream`をデバッグ表示してみて、思った通りの結果になっているかを確認してみましょう。
+
+```shell
+lvs7k@wsl2:~/hello-proc-macro$ cargo expand --bin hello-proc-macro
+    Checking hello-proc-macro v0.1.0 (/home/lvs7k/hello-proc-macro)
+[src/lib.rs:28:5] &ret = TokenStream [
+    Ident {
+        ident: "fn",
+        span: #5 bytes(41..48),
+    },
+    Ident {
+        ident: "executable",
+        span: #0 bytes(76..86),
+    },
+    Group {
+        delimiter: Parenthesis,
+        stream: TokenStream [],
+        span: #5 bytes(41..48),
+    },
+    Group {
+        delimiter: Brace,
+        stream: TokenStream [],
+        span: #5 bytes(41..48),
+    },
+    Ident {
+        ident: "fn",
+        span: #5 bytes(41..48),
+    },
+    Ident {
+        ident: "args",
+        span: #0 bytes(100..104),
+    },
+    Group {
+        delimiter: Parenthesis,
+        stream: TokenStream [],
+        span: #5 bytes(41..48),
+    },
+    Group {
+        delimiter: Brace,
+        stream: TokenStream [],
+        span: #5 bytes(41..48),
+    },
+]
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+
+#![feature(prelude_import)]
+#[prelude_import]
+use std::prelude::rust_2021::*;
+#[macro_use]
+extern crate std;
+use hello_proc_macro::Builder;
+pub struct Command {
+    executable: String,
+    args: Vec<String>,
+}
+fn executable() {}
+fn args() {}
+fn main() {}
+```
+
+想定通り、`fn executable() {}`と`fn args() {}`の2行が出力されましたね🎉ここまでの内容がわかればワークショップを開始することができるのではないかと思います。はじめに、の最後としてエラーハンドリングについて少し説明します。
+
+### エラーハンドリング
+
+正しいエラーハンドリングが何かは私もわかっていないのですが、いくつか見た参考資料をまとめると下記のようにするのがよいのではないでしょうか。
+
+```rust
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, FieldsNamed};
+
+#[proc_macro_derive(Builder)]
+pub fn derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    expand(input)
+        .unwrap_or_else(|e| e.into_compile_error())
+        .into()
+}
+
+fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(FieldsNamed { named, .. }),
+        ..
+    }) = input.data
+    else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "#[derive(Builder)]が使えるのは名前付きの構造体のみです。",
+        ));
+    };
+
+    let fields = named
+        .iter()
+        .map(|field| field.ident.as_ref().unwrap())
+        .collect::<Vec<_>>();
+
+    Ok(quote! {
+        #(
+            fn #fields() {}
+        )*
+    })
+}
+```
+
+`fn derive(input: TokenStream) -> TokenStream`という型をみて、戻り値が`Result`ではないことに疑問を持った人もいるのではないでしょうか。手続き型マクロでは`TokenStream`に`compile_error!`マクロを出力することでエラーを表現します。上記のコードでは`syn::Error::into_compile_error()`というメソッドを用いて、エラーを表現しています。
+
+> [!NOTE]
+> `compile_error!`マクロはRustの標準ライブラリで定義されています。
+
+マクロを展開するロジックを別の関数に分けて、戻り値を`syn::Result<proc_macro2::TokenStream>`としています。パターンマッチなどでエラーとなった場合は`syn::Error`を返します。`proc_macro::Span`はソースコードの範囲を表しています。`syn::Error`の作成時には`Span`を設定することでマクロがどこでエラーになったのか詳細なエラーメッセージを表示することができます。
+
+`src/main.rs`を書き換えて名前付きではない構造体に`#[derive(Builder)]`を付けてエラーを発生させてみましょう。
+
+```rust
+use hello_proc_macro::Builder;
+
+#[derive(Builder)]
+pub struct Command;
+
+fn main() {}
+```
+
+```shell
+lvs7k@wsl2:~/hello-proc-macro$ cargo check
+    Checking hello-proc-macro v0.1.0 (/home/lvs7k/hello-proc-macro)
+error: #[derive(Builder)]が使えるのは名前付きの構造体のみです。
+ --> src/main.rs:4:1
+  |
+4 | pub struct Command;
+  | ^^^^^^^^^^^^^^^^^^^
+```
+
+指定したエラーメッセージが表示されて、`Span`の範囲のソースコードでエラーになったことがわかります。
+
+それでは実際にワークショップのbuilderに取り組んでみましょう😊
