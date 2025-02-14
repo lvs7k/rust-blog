@@ -9,6 +9,18 @@ Rustの手続き型マクロを学ぶのに[Rust Latam: procedural macros worksh
   - [戻り値のTokenStreamの作成](#戻り値のtokenstreamの作成)
   - [入力のTokenStreamの解析](#入力のtokenstreamの解析)
   - [エラーハンドリング](#エラーハンドリング)
+- [builder](#builder)
+  - [01-parse](#01-parse)
+  - [02-create-builders](#02-create-builders)
+  - [03-call-setters](#03-call-setters)
+  - [04-call-build](#04-call-build)
+  - [05-method-chaining](#05-method-chaining)
+  - [06-optional-field](#06-optional-field)
+  - [07-repeated-field](#07-repeated-field)
+  - [08-unrecognized-attribute](#08-unrecognized-attribute)
+  - [09-redefined-prelude-types](#09-redefined-prelude-types)
+  - [私が書いたコード](#私が書いたコード)
+- [さいごに](#さいごに)
 
 ## はじめに
 
@@ -228,6 +240,9 @@ fn main() {}
 ```
 
 `#[derive(..)]`を付けた構造体の下に、`fn hello() {}`という関数が出力されましたね😊このように戻り値の`TokenStream`を展開した結果が構造体の下に追加されます。`impl XXX for Command { ... }`のように構造体に対してトレイトを実装する`TokenStream`を作成すれば、`Debug`や`Clone`と同様に構造体に対して自動でトレイトを実装することができるのです。思っていたよりもシンプルな仕組みだと感じたのではないでしょうか？
+
+> [!NOTE]
+> 手続き型マクロで定義できるマクロは"Derive macro", "Function-like macro", "Attribute macro"の3種類があります。戻り値の`TokenStream`がソースコードに「追加」されるのは"Derive macro"のみです。他の2つでは「置換」されます。
 
 ### 戻り値の`TokenStream`の作成
 
@@ -569,3 +584,384 @@ error: #[derive(Builder)]が使えるのは名前付きの構造体のみです�
 指定したエラーメッセージが表示されて、`Span`の範囲のソースコードでエラーになったことがわかります。
 
 それでは実際にワークショップのbuilderに取り組んでみましょう😊
+
+## builder
+
+### 01-parse
+
+builderの`src/lib.rs`には`unimplemented!()`が書かれているためエラーとなってしまいます。このテストではとりあえずエラーにならなければよいので、空の`TokenStream`を返しましょう。また、テストのコメントに書かれている通り入力の`TokenStream`を`parse_macro_input!`で`DeriveInput`構文木へと変換して中身を見てみましょう。
+
+### 02-create-builders
+
+このテストはいきなりちょっと難しいです😭もし出来なかったとしても落ち込まなくてよいと思います😊目標は`Command`構造体の後に下記のようなコードを出力することです。
+
+```rust
+pub struct CommandBuilder {
+    executable: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<Vec<String>>,
+    current_dir: Option<String>,
+}
+
+impl Command {
+    pub fn builder() -> CommandBuilder {
+        CommandBuilder {
+            executable: None,
+            args: None,
+            env: None,
+            current_dir: None,
+        }
+    }
+}
+```
+
+だからといって`quote!`に直接このコードを書いてはいけません。`DeriveInput`から`Command`構造体のフィールド名とその型を取得して、`quote!`を使いましょう。`CommandBuilder`という識別子を作るには、[syn::IdentのExample](https://docs.rs/syn/latest/syn/struct.Ident.html#examples)や[quoteのformat_ident!](https://docs.rs/quote/latest/quote/macro.format_ident.html)が参考になります。
+
+### 03-call-setters
+
+テスト02で作成した`CommandBuilder`に値を設定するメソッドを定義しましょう。
+
+### 04-call-build
+
+`CommandBuilder`に`build()`というメソッドを追加しましょう。`CommandBuilder`のフィールドに設定された値から`Command`を作成します。
+
+`CommandBuilder`のフィールドに`None`が残っていたらエラーにしましょう。エラーの型については重要ではないので`build()`メソッドの戻り値は`Result<Command, Box<dyn std::error::Error>>`で十分です。`std::error::Error`は`From<String>`を実装しているので、`String`を返せばよいと思います。
+
+### 05-method-chaining
+
+このテストは03と04が正しく実装されていれば問題ありません。テスト03で作成したメソッドは`fn executable(&mut self, executable: String) -> &mut Self`のように`&mut Self`を返しているので、下記のように書くことができて便利だよねという内容です。
+
+```rust
+let command = Command::builder()
+    .executable("cargo".to_owned())
+    .args(vec!["build".to_owned(), "--release".to_owned()])
+    .env(vec![])
+    .current_dir("..".to_owned())
+    .build()
+    .unwrap();
+```
+
+### 06-optional-field
+
+このテストでは`Command`のフィールドの中に`Option<String>`が存在します。やりたいことは、フィールドの型が`Option`の場合は`CommandBuilder`のフィールドが未設定(`None`)の状態でも`build()`メソッドで`Command`が作成できるようにすることです。具体的には下記の事項に取り組みましょう。
+
+- フィールドの型が`Option<String>`の場合、
+  - 今までの実装だと対応する`Builder`のフィールドの型は`Option<Option<String>>`になってしまうが、`Option<String>`になるようにする。
+  - `Builder`に実装するセッターメソッドの引数を`Option<String>`ではなく`String`にする。
+  - `build()`メソッドで`Command`を作成する際に、`Builder`のフィールドの値をクローンして設定する。
+
+難しいというか面倒くさいのはテストのコメントにも書かれているように`Option<String>`から`String`の部分を取り出すところです。頑張ってパターンマッチしていきましょう😭
+
+### 07-repeated-field
+
+難易度的にはこのテストが実質このワークショップの最後のテストだと思います、難しいですが頑張りましょう😊
+
+下記のコードのように、フィールドに対して属性が設定されています。
+
+```rust
+#[derive(Builder)]
+pub struct Command {
+    executable: String,
+    #[builder(each = "arg")]
+    args: Vec<String>,
+    #[builder(each = "env")]
+    env: Vec<String>,
+    current_dir: Option<String>,
+}
+```
+
+やりたいことは例えば`#[builder(each = "arg")]`の場合、`CommandBuilder`のセッターメソッドとして`arg()`という`Vec`に要素を1つ追加するメソッドを定義することです。`args()`という`Vec`を一括で設定するセッターメソッドも残しておかなければなりません。`env`のようにフィールド名と同じ名前が指定されている場合は、要素を1つ追加するメソッドの定義のみでよいです。また、`#[builder(each = "...")]`が付いているフィールドの型は`Vec`であることを前提としてよいです。
+
+- フィールドの型が`Vec<String>`の場合、
+  - `Builder`のフィールドの型は`Option<Vec<String>>`ではなく`Vec<String>`にする。
+  - 一括で設定するセッターメソッドの引数は`Vec<String>`として、引数の値をそのまま`Builder`に設定する。
+  - 1要素を追加するセッターメソッドの引数は`String`として、引数の値を`Vec`へ`push`する。
+  - `build()`メソッドで`Command`を作成する際に、`Builder`のフィールドの値をクローンして設定する。
+
+### 08-unrecognized-attribute
+
+`#[builder(eac = "arg")]`のように`each`以外だった場合はエラーとなるようにします。下記のように属性部分に下線が引かれるように適切に`Span`を設定しましょう。
+
+```shell
+error: expected `builder(each = "...")`
+  --> tests/08-unrecognized-attribute.rs:22:7
+   |
+22 |     #[builder(eac = "arg")]
+   |       ^^^^^^^^^^^^^^^^^^^^
+```
+
+### 09-redefined-prelude-types
+
+マクロ展開先のソースコードで例えば`type Option = ();`のように`Option`が別の意味になってしまっていても、マクロが動作するようにします。具体的にはコメントにあるように`Option`を`std::option::Option`のように絶対パスで指定すればよいです。
+
+### 私が書いたコード
+
+Rust初心者のため綺麗なコードではないと思いますが、私がワークショップにチャレンジした際のコードを記載します。参考になれば幸いです😊
+
+```rust
+use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::{format_ident, quote};
+use syn::{
+    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Fields, FieldsNamed,
+    GenericArgument, Ident, LitStr, PathArguments, PathSegment, Type, TypePath,
+};
+
+#[proc_macro_derive(Builder, attributes(builder))]
+pub fn derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    // syn::Resultがエラーだった場合は、`into_compile_error()`でTokenStreamに変換する。
+    expand(input)
+        .unwrap_or_else(|e| e.into_compile_error())
+        .into()
+}
+
+fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let struct_name = &input.ident;
+    let builder_name = format_ident!("{}Builder", struct_name);
+
+    // #[derive(Builder)]の対象が名前付きの構造体ではない場合はエラー。
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(fields_named),
+        ..
+    }) = input.data
+    else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "Builder trait can only be derived for a named struct.",
+        ));
+    };
+
+    let builder_struct_fields = expand_builder_struct_fields(&fields_named)?;
+    let builder_default_fields = expand_builder_default_fields(&fields_named)?;
+    let builder_methods = expand_builder_methods(&fields_named)?;
+    let build_method = expand_build_method(struct_name, &fields_named)?;
+
+    // 今回は使用しないが、#[derive(Builder)]を付けた構造体の型パラメータやwhere句部分を取り出す際に使用する。
+    // let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    Ok(quote! {
+        pub struct #builder_name {
+            #builder_struct_fields
+        }
+
+        impl #struct_name {
+            pub fn builder() -> #builder_name {
+                #builder_name {
+                    #builder_default_fields
+                }
+            }
+        }
+
+        impl #builder_name {
+            #builder_methods
+            #build_method
+        }
+    })
+}
+
+// Builder構造体のフィールド部分のTokenStreamを作成する。
+fn expand_builder_struct_fields(fields: &FieldsNamed) -> syn::Result<TokenStream2> {
+    let mut ret = TokenStream2::new();
+
+    for field in &fields.named {
+        let field_name = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+
+        if get_types_argument(&field.ty, "Option").is_some()
+            || get_types_argument(&field.ty, "Vec").is_some()
+        {
+            // 元の構造体のフィールドの型がOptionかVecならば、そのままBuilder構造体のフィールドとする。
+            ret.extend(quote! {
+                #field_name: #ty,
+            });
+        } else {
+            // それ以外の場合はOptionにする。
+            ret.extend(quote! {
+                #field_name: std::option::Option<#ty>,
+            });
+        }
+    }
+
+    Ok(ret)
+}
+
+// Option<...>とVec<...>の...の部分を取り出す。
+fn get_types_argument<'a>(typ: &'a Type, ident_str: &'_ str) -> Option<&'a GenericArgument> {
+    let Type::Path(TypePath { path, .. }) = typ else {
+        return None;
+    };
+
+    let PathSegment {
+        ident,
+        arguments: PathArguments::AngleBracketed(abga),
+    } = path.segments.first()?
+    else {
+        return None;
+    };
+
+    if ident != ident_str {
+        return None;
+    }
+
+    Some(&abga.args[0])
+}
+
+// `builder()`メソッドの戻り値の構造体のフィールド部分のTokenStreamを作成する。
+fn expand_builder_default_fields(fields: &FieldsNamed) -> syn::Result<TokenStream2> {
+    let mut ret = TokenStream2::new();
+
+    for field in &fields.named {
+        let field_name = field.ident.as_ref().unwrap();
+
+        if let Some(_arg) = get_types_argument(&field.ty, "Vec") {
+            ret.extend(quote! {
+                #field_name: Vec::new(),
+            });
+        } else {
+            ret.extend(quote! {
+                #field_name: std::option::Option::None,
+            });
+        }
+    }
+
+    Ok(ret)
+}
+
+// Builder構造体のフィールドを設定するメソッド定義部分のTokenStreamを作成する。
+fn expand_builder_methods(fields: &FieldsNamed) -> syn::Result<TokenStream2> {
+    let mut ret = TokenStream2::new();
+
+    for field in &fields.named {
+        let field_name = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+
+        // 元の構造体のフィールドの型がOption<...>の場合はメソッドの引数に...型を受け取り、フィールドに設定する。
+        if let Some(arg) = get_types_argument(&field.ty, "Option") {
+            ret.extend(quote! {
+                fn #field_name(&mut self, #field_name: #arg) -> &mut Self {
+                    self.#field_name = std::option::Option::Some(#field_name);
+                    self
+                }
+            });
+            continue;
+        }
+
+        // `builder(each = "...")`の"..."の部分のLitStrを取得する。
+        if let Some(each_method_name) = get_builder_each_attribute(&field.attrs)? {
+            // `builder(each = "...")`の"..."の部分のLitStrより、フィールド設定メソッドのIdentを作成する。
+            let each_method_name = format_ident!("{}", each_method_name.value());
+
+            if let Some(arg) = get_types_argument(&field.ty, "Vec") {
+                // 元の構造体のフィールドの型がVecの場合は、Builder構造体のフィールドのVecに1要素をプッシュするメソッドを作成する。
+                ret.extend(quote! {
+                    fn #each_method_name(&mut self, #each_method_name: #arg) -> &mut Self {
+                        self.#field_name.push(#each_method_name);
+                        self
+                    }
+                });
+            } else {
+                // #[builder(each = "...")]を付けることができるフィールドはVecのみ。
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "a field with builder attribute must have the type Vec.",
+                ));
+            }
+
+            // eachで指定した名称が構造体のフィールド名と同じ場合は、Vecに1要素をプッシュするメソッドのみを作成する。
+            // 下のコードのフィールドを一括設定するメソッドを定義しないようにcontinueする。
+            if field_name == &each_method_name {
+                continue;
+            }
+        }
+
+        if let Some(_arg) = get_types_argument(&field.ty, "Vec") {
+            // 元の構造体のフィールドの型がVecの場合で「eachが指定されていない」or「eachで指定された名称とフィールド名が異なる」場合は、
+            // メソッドの引数で受け取ったVecをそのままBuilderのフィールドに設定する。
+            ret.extend(quote! {
+                fn #field_name(&mut self, #field_name: #ty) -> &mut Self {
+                    self.#field_name = #field_name;
+                    self
+                }
+            });
+        } else {
+            // それ以外の場合はBuilderのフィールドはOptionなので、メソッドの引数の値をSomeで設定する。
+            ret.extend(quote! {
+                fn #field_name(&mut self, #field_name: #ty) -> &mut Self {
+                    self.#field_name = std::option::Option::Some(#field_name);
+                    self
+                }
+            });
+        }
+    }
+
+    Ok(ret)
+}
+
+// `builder(each = "...")`の"..."の部分のLitStrを取得する。
+// Reference: syn::ParseNestedMeta.value
+fn get_builder_each_attribute(attrs: &[Attribute]) -> syn::Result<Option<LitStr>> {
+    let mut res = None;
+
+    for attr in attrs {
+        if attr.path().is_ident("builder") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("each") {
+                    let value = meta.value()?;
+                    let s: LitStr = value.parse()?;
+                    res = Some(s);
+                    Ok(())
+                } else {
+                    Err(meta.error("expected `builder(each = \"...\")`"))
+                }
+            })?;
+            break;
+        }
+    }
+
+    Ok(res)
+}
+
+// impl ...Builderのbuild()メソッド定義のTokenStreamを作成する。
+fn expand_build_method(struct_name: &Ident, fields: &FieldsNamed) -> syn::Result<TokenStream2> {
+    let mut return_struct_fields = TokenStream2::new();
+
+    for field in &fields.named {
+        let field_name = field.ident.as_ref().unwrap();
+
+        if get_types_argument(&field.ty, "Option").is_some()
+            || get_types_argument(&field.ty, "Vec").is_some()
+        {
+            // 元の構造体のフィールドの型がOptionかVecならばBuilder構造体のフィールドの型も同じ型なので、クローンして設定する。
+            return_struct_fields.extend(quote! {
+                #field_name: self.#field_name.clone(),
+            });
+        } else {
+            // 元の構造体のフィールドがOptionかVec以外ならばBuilder構造体のフィールドの型はOptionなので、
+            // Optionの中身を取り出して設定する。OptionがNoneならばエラー。
+            return_struct_fields.extend(quote! {
+                #field_name: self.#field_name.as_ref().cloned().ok_or(format!("{} is not yet set.", stringify!(#field_name)))?,
+            });
+        }
+    }
+
+    Ok(quote! {
+        pub fn build(&mut self) -> std::result::Result<#struct_name, std::boxed::Box<dyn std::error::Error>> {
+            Ok(#struct_name {
+                #return_struct_fields
+            })
+        }
+    })
+}
+```
+
+## さいごに
+
+Rustについてわかりやすい記事を書いてくださっている皆さんに感謝しています。皆さんの記事を見ているうちに私も学んだことを文章にして残したいという気持ちが高まり、今回初めてこのようなものを書いてみました。私はRust上級者でも頭が良いわけでもありませんが、Rust学習者の中には私と同じようなレベルの人たちもいるかもしれません。そのような人たちに私が書いたものが少しでも参考になり、何かしらRustコミュニティへ還元できたら嬉しいです😊
+
+## 参考資料
+
+- [Rust Latam: procedural macros workshop](https://github.com/dtolnay/proc-macro-workshop)
+- [proc-macro-workshopの進め方（derive_builder編）](https://zenn.dev/taro137/articles/bb45823b83d354)
+- [Rustマクロ冬期講習 Advent Calendar 2024](https://qiita.com/advent-calendar/2024/rust-macro)
