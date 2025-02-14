@@ -6,6 +6,8 @@ Rustの手続き型マクロを学ぶのに[Rust Latam: procedural macros worksh
 - [はじめに](#はじめに)
   - [手続き型マクロのライブラリの作成](#手続き型マクロのライブラリの作成)
   - [手続き型マクロの仕組み](#手続き型マクロの仕組み)
+  - [戻り値のTokenStreamの作成](#戻り値のtokenstreamの作成)
+  - [入力のTokenStreamの解析](#入力のtokenstreamの解析)
 
 ## はじめに
 
@@ -181,3 +183,248 @@ lvs7k@wsl2:~/hello-proc-macro$ cargo check
 ```
 
 </details>
+
+出力結果を見ると`TokenStream`とは[TokenTree](https://doc.rust-lang.org/proc_macro/enum.TokenTree.html)のリストであることがわかります。`TokenStream`は`FromIterator<TokenTree>`を実装しているので、下記のように`TokenStream`を作成することができます。
+```rust
+use proc_macro::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
+
+#[proc_macro_derive(Builder)]
+pub fn derive(input: TokenStream) -> TokenStream {
+    let _ = input;
+
+    let tt = [
+        TokenTree::Ident(Ident::new("fn", Span::call_site())),
+        TokenTree::Ident(Ident::new("hello", Span::call_site())),
+        TokenTree::Group(Group::new(Delimiter::Parenthesis, TokenStream::new())),
+        TokenTree::Group(Group::new(Delimiter::Brace, TokenStream::new())),
+    ];
+
+    tt.into_iter().collect()
+}
+```
+
+> [!NOTE]
+> ネタバレになってしまいますが、今後このような書き方はすることがないので覚える必要はありません。
+
+`cargo expand`を実行して、マクロ展開後のソースコードを見てみましょう。
+```shell
+lvs7k@wsl2:~/hello-proc-macro$ cargo expand --bin hello-proc-macro
+    Checking hello-proc-macro v0.1.0 (/home/lvs7k/hello-proc-macro)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+#![feature(prelude_import)]
+#[prelude_import]
+use std::prelude::rust_2021::*;
+#[macro_use]
+extern crate std;
+use hello_proc_macro::Builder;
+pub struct Command {
+    executable: String,
+    args: Vec<String>,
+}
+fn hello() {}
+fn main() {}
+```
+
+`#[derive(..)]`を付けた構造体の下に、`fn hello() {}`という関数が出力されましたね😊このように戻り値の`TokenStream`を展開した結果が構造体の下に追加されます。`impl XXX for Command { ... }`のように構造体に対してトレイトを実装する`TokenStream`を作成すれば、`Debug`や`Clone`と同様に構造体に対して自動でトレイトを実装することができるのです。思っていたよりもシンプルな仕組みだと感じたのではないでしょうか？
+
+### 戻り値の`TokenStream`の作成
+
+戻り値の`TokenStream`を作成するのに`TokenTree`をたくさん書くのはさすがに大変すぎるので、便利なクレートが用意されています。それが`quote`クレートです。
+
+```rust
+use proc_macro::TokenStream;
+use quote::quote;
+
+#[proc_macro_derive(Builder)]
+pub fn derive(input: TokenStream) -> TokenStream {
+    let _ = input;
+
+    quote! {
+        fn hello() {}
+    }
+    .into()
+}
+```
+
+このように`quote!`の中に通常のRustコードを書くだけで、そのコードを構文解析して前の例と同じ`TokenStream`を作成してくれます。
+
+> [!NOTE]
+> `quote!`マクロが返す`TokenStream`は`proc_macro2::TokenStream`です。`.into()`により`proc_macro2::TokenStream`から`proc_macro::TokenStream`へ変換を行っています。`proc_macro2`クレートは`proc_macro`クレートのラッパーです。なぜ`proc_macro2`クレートが存在するのかは、他の方が書いた説明を参照してください。
+
+### 入力の`TokenStream`の解析
+
+引数で与えられた`TokenStream`をもとに戻り値の`TokenStream`を作成すればよいということになりますが、前に見たように`TokenStream`は単純な`TokenTree`のリストなので、戻り値の`TokenStream`を出力するのに必要な情報を取り出すことが難しいです。これを行うのに大変便利なのが`syn`クレートです。
+
+```rust
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, DeriveInput};
+
+#[proc_macro_derive(Builder)]
+pub fn derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    dbg!(&input);
+
+    quote! {
+        fn hello() {}
+    }
+    .into()
+}
+```
+
+`parse_macro_input!(input as DeriveInput)`の部分に注目してください。ここで`TokenStream`を解析して、[DeriveInput](https://docs.rs/syn/latest/syn/struct.DeriveInput.html)という構文木を出力しています。`cargo check`でデバッグ表示してみましょう。
+<details>
+<summary>DeriveInputのデバッグ表示</summary>
+
+```shell
+lvs7k@wsl2:~/hello-proc-macro$ cargo check
+    Checking hello-proc-macro v0.1.0 (/home/lvs7k/hello-proc-macro)
+[src/lib.rs:9:5] &input = DeriveInput {
+    attrs: [],
+    vis: Visibility::Public(
+        Pub,
+    ),
+    ident: Ident {
+        ident: "Command",
+        span: #0 bytes(62..69),
+    },
+    generics: Generics {
+        lt_token: None,
+        params: [],
+        gt_token: None,
+        where_clause: None,
+    },
+    data: Data::Struct {
+        struct_token: Struct,
+        fields: Fields::Named {
+            brace_token: Brace,
+            named: [
+                Field {
+                    attrs: [],
+                    vis: Visibility::Inherited,
+                    mutability: FieldMutability::None,
+                    ident: Some(
+                        Ident {
+                            ident: "executable",
+                            span: #0 bytes(76..86),
+                        },
+                    ),
+                    colon_token: Some(
+                        Colon,
+                    ),
+                    ty: Type::Path {
+                        qself: None,
+                        path: Path {
+                            leading_colon: None,
+                            segments: [
+                                PathSegment {
+                                    ident: Ident {
+                                        ident: "String",
+                                        span: #0 bytes(88..94),
+                                    },
+                                    arguments: PathArguments::None,
+                                },
+                            ],
+                        },
+                    },
+                },
+                Comma,
+                Field {
+                    attrs: [],
+                    vis: Visibility::Inherited,
+                    mutability: FieldMutability::None,
+                    ident: Some(
+                        Ident {
+                            ident: "args",
+                            span: #0 bytes(100..104),
+                        },
+                    ),
+                    colon_token: Some(
+                        Colon,
+                    ),
+                    ty: Type::Path {
+                        qself: None,
+                        path: Path {
+                            leading_colon: None,
+                            segments: [
+                                PathSegment {
+                                    ident: Ident {
+                                        ident: "Vec",
+                                        span: #0 bytes(106..109),
+                                    },
+                                    arguments: PathArguments::AngleBracketed {
+                                        colon2_token: None,
+                                        lt_token: Lt,
+                                        args: [
+                                            GenericArgument::Type(
+                                                Type::Path {
+                                                    qself: None,
+                                                    path: Path {
+                                                        leading_colon: None,
+                                                        segments: [
+                                                            PathSegment {
+                                                                ident: Ident {
+                                                                    ident: "String",
+                                                                    span: #0 bytes(110..116),
+                                                                },
+                                                                arguments: PathArguments::None,
+                                                            },
+                                                        ],
+                                                    },
+                                                },
+                                            ),
+                                        ],
+                                        gt_token: Gt,
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+                Comma,
+            ],
+        },
+        semi_token: None,
+    },
+}
+```
+
+</details>
+
+あとはここから必要な情報を取り出して、`quote!`マクロを使って戻り値の`TokenStream`を作成するだけです😊例として`Command`構造体の`arg`というフィールドを取り出してみましょう。通常のRustコードを書くときと同様に、パターンマッチをしていきます。
+
+```rust
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, FieldsNamed};
+
+#[proc_macro_derive(Builder)]
+pub fn derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(FieldsNamed { named, .. }),
+        ..
+    }) = input.data
+    else {
+        panic!("#[derive(Builder)]が使えるのは名前付きの構造体のみです。");
+    };
+
+    let fields = named
+        .iter()
+        .map(|field| field.ident.as_ref().unwrap())
+        .collect::<Vec<_>>();
+
+    let ret = quote! {
+        #(
+            fn #fields() {}
+        )*
+    };
+
+    dbg!(&ret);
+
+    ret.into()
+}
+```
