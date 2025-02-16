@@ -124,12 +124,12 @@ Wikipediaの説明では「7の倍数ビットに拡張してから分割」と�
 
 ```rust
 pub fn from_leb128_u32(input: &[u8]) -> Result<u32, String> {
-    let mut result: u32 = 0;
+    let mut result: u128 = 0;
     let mut shift: usize = 0;
-    let size: usize = std::mem::size_of::<u32>() * 8;
+    let size: usize = std::mem::size_of_val(&result) * 8;
 
     for &byte in input {
-        result |= ((byte & 0b01111111) as u32) << shift;
+        result |= ((byte & 0b01111111) as u128) << shift;
         shift += 7;
 
         if shift >= size {
@@ -141,7 +141,7 @@ pub fn from_leb128_u32(input: &[u8]) -> Result<u32, String> {
         }
     }
 
-    Ok(result)
+    u32::try_from(result).map_err(|e| e.to_string())
 }
 ```
 
@@ -166,6 +166,10 @@ break
 
 result: 00000000000000000000000010000000
 ```
+
+ビットを操作して最終的な結果を返す`result`の型を`u128`にしています。
+上の例のように整数128はLEB128にエンコードすると2バイトになりますが、もし`result`の型が`u8`だったとすると7ビットを2つ結合して14ビットとなり8を超えてしまいます。
+作業スペースとして大きい`u128`を使用して、最後に`try_from`で変換しています。
 
 ## 符号あり整数のエンコード
 
@@ -353,12 +357,12 @@ pub fn to_leb128_i32(mut value: i32) -> Vec<u8> {
 
 ```rust
 pub fn from_leb128_i32(input: &[u8]) -> Result<i32, String> {
-    let mut result: i32 = 0;
+    let mut result: i128 = 0;
     let mut shift: usize = 0;
-    let size: usize = std::mem::size_of::<i32>() * 8;
+    let size: usize = std::mem::size_of_val(&result) * 8;
 
     for &byte in input {
-        result |= ((byte & 0b01111111) as i32) << shift;
+        result |= ((byte & 0b01111111) as i128) << shift;
         shift += 7;
 
         if shift >= size {
@@ -367,13 +371,13 @@ pub fn from_leb128_i32(input: &[u8]) -> Result<i32, String> {
 
         if byte & 0b10000000 == 0 {
             if byte & 0b01000000 != 0 {
-                result |= !0i32 << shift;
+                result |= !0 << shift;
             }
             break;
         }
     }
 
-    Ok(result)
+    i32::try_from(result).map_err(|e| e.to_string())
 }
 ```
 
@@ -390,7 +394,7 @@ pub fn from_leb128_i32(input: &[u8]) -> Result<i32, String> {
 
 `if byte & 0b10000000 == 0`は先頭ビットが0なので、エンコードした結果の最後のバイトであることを示しています。
 次の`if byte & 0b01000000 != 0`では最後のバイトの上から2桁目のバイトが1かどうか、つまり負の数であるかをチェックしています。
-負である場合、`result |= !0i32 << shift;`の部分で結果の上位ビットを1で埋め尽くして負の数にしています。
+負である場合、`result |= !0 << shift;`の部分で結果の上位ビットを1で埋め尽くして負の数にしています。
 
 > [!NOTE]
 > `!`はビット反転演算子です。C言語では`~`ですが、Rustでは`!`です。ここでは`0`を反転して`11111111...`というビット列を作成しています。
