@@ -1,18 +1,23 @@
 # WebAssemblyのランタイムの一部分を実装してみる
 
 **目次**
-- はじめに
-- '1. テキスト形式とバイナリ形式
-  - '1.1. サンプルプログラム
-  - '1.2. 知っておきたいこと
-- '2. 構文木の定義と構文解析
-  - '2.1. モジュール構成
-  - '2.2. 構文木の定義
-  - '2.3. 構文解析
-- '3. 検証
-  - '3.1. 関数以外の検証
-  - '3.2. 関数の検証
-- おわりに
+- [はじめに](#はじめに)
+- ['1. テキスト形式とバイナリ形式](#1-テキスト形式とバイナリ形式)
+  - ['1.1. サンプルプログラム](#11-サンプルプログラム)
+  - ['1.2. 知っておきたいこと](#12-知っておきたいこと)
+- ['2. 構文木の定義と構文解析](#2-構文木の定義と構文解析)
+  - ['2.1. モジュール構成](#21-モジュール構成)
+  - ['2.2. 構文木の定義](#22-構文木の定義structurers)
+  - ['2.3. 構文解析](#23-構文解析binaryrs)
+- ['3. 検証](#3-検証)
+  - ['3.1. 関数以外の検証](#31-関数以外の検証validationrs)
+  - ['3.2. 関数の検証](#32-関数の検証validationfuncrs)
+- ['4. 実行](#4-実行)
+  - ['4.1. 実行時の型](#41-実行時の型executionrs)
+  - ['4.2. インタープリタ](#42-インタープリタinterpreterrs)
+- ['5. ホスト環境への埋め込み](#5-ホスト環境への埋め込み)
+- ['6. 実際に動かしてみよう](#6-実際に動かしてみようmainrs)
+- [おわりに](#おわりに)
 
 ## はじめに
 
@@ -1777,3 +1782,616 @@ pub(super) fn validate_func(context: &Context, func: &Func) -> Option<()> {
 `label`の継続が何もないので、これは関数呼び出しは`block`の実行として置き換えられることを意味しています。
 `label`の引数(arity)は関数の戻り値の数`m`となっています。
 なので関数呼び出しの検証を`block`の検証に置き換えて行っています。
+
+### 4. 実行
+
+関数の検証が他に比べて複雑なので、別のモジュールに分けます。
+
+```shell
+lvs7k@wsl2:~/wasmpl-rs$ tree --gitignore
+.
+├── Cargo.toml
+├── example
+│   └── fibonacci.wat
+└── src
+    ├── binary.rs
+    ├── embedding.rs
+    ├── execution.rs   # これと
+    ├── interpreter.rs # これを作ります
+    ├── lib.rs
+    ├── main.rs
+    ├── structure.rs
+    ├── validation
+    │   └── func.rs
+    └── validation.rs
+```
+
+#### 4.1. 実行時の型(`execution.rs`)
+
+Executionの[Runtime Structure](https://webassembly.github.io/spec/core/exec/runtime.html)を見ながら必要な型を定義します。
+
+```rust
+use std::rc::Rc;
+
+use crate::structure::*;
+
+// Runtime Structure
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Num {
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Val {
+    Num(Num),
+}
+```
+
+後で必要になるので実行時の値から型を得るメソッドと、型から実行時のデフォルト値を取得するメソッドを定義します。
+
+```rust
+impl Val {
+    pub fn valtype(&self) -> ValType {
+        match self {
+            Val::Num(Num::I32(_)) => ValType::Num(NumType::I32),
+            Val::Num(Num::I64(_)) => ValType::Num(NumType::I64),
+            Val::Num(Num::F32(_)) => ValType::Num(NumType::F32),
+            Val::Num(Num::F64(_)) => ValType::Num(NumType::F64),
+        }
+    }
+}
+
+impl ValType {
+    pub fn default_val(&self) -> Val {
+        match self {
+            ValType::Num(NumType::I32) => Val::Num(Num::I32(0)),
+            ValType::Num(NumType::I64) => Val::Num(Num::I64(0)),
+            ValType::Num(NumType::F32) => Val::Num(Num::F32(0.0)),
+            ValType::Num(NumType::F64) => Val::Num(Num::F64(0.0)),
+        }
+    }
+}
+```
+
+```rust
+#[derive(Debug)]
+pub enum Trap {
+    Unreachable,
+}
+
+#[derive(Debug, Default)]
+pub struct Store {
+    pub funcs: Vec<FuncInst>,
+}
+
+pub type Addr = usize;
+
+#[derive(Debug)]
+pub struct ModuleInst {
+    pub types: Vec<FuncType>,
+    pub funcaddrs: Vec<Addr>,
+    pub exports: Vec<ExportInst>,
+}
+
+#[derive(Debug, Clone)]
+pub enum FuncInst {
+    Wasm {
+        type_: FuncType,
+        module: Rc<ModuleInst>,
+        code: Rc<Func>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportInst {
+    pub name: String,
+    pub value: ExternVal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternVal {
+    Func(Addr),
+    Table(Addr),
+    Mem(Addr),
+    Global(Addr),
+}
+```
+
+Executionの[Modules](https://webassembly.github.io/spec/core/exec/modules.html)を見ながらモジュールのインスタンス化を行う関数を定義します。
+仕様によると関数のインスタンス(`FuncInst`)はモジュールのインスタンス(`ModuleInst`)への参照を持つので、
+先に関数のアドレスだけ割り当ててモジュールのインスタンスを作成し、`Rc<ModuleInst>`を関数のインスタンスに持たせています。
+
+```rust
+// Modules
+
+fn allocmodule(store: &mut Store, module: &Module) -> Rc<ModuleInst> {
+    let types = module.types.clone();
+
+    // allocate function addresses
+    let funcaddrs = (store.funcs.len()..store.funcs.len() + module.funcs.len()).collect::<Vec<_>>();
+
+    let exports = module
+        .exports
+        .iter()
+        .enumerate()
+        .map(|(i, export)| ExportInst {
+            name: export.name.clone(),
+            value: ExternVal::Func(funcaddrs[i]),
+        })
+        .collect();
+
+    let moduleinst = Rc::new(ModuleInst {
+        types,
+        funcaddrs,
+        exports,
+    });
+
+    // allocate functions
+    module.funcs.iter().for_each(|func| {
+        store.funcs.push(FuncInst::Wasm {
+            type_: moduleinst.types[func.type_ as usize].clone(),
+            module: moduleinst.clone(),
+            code: func.clone(),
+        })
+    });
+
+    moduleinst
+}
+
+pub fn instantiate(store: &mut Store, module: &Module) -> Result<Rc<ModuleInst>, Trap> {
+    Ok(allocmodule(store, module))
+}
+```
+
+#### 4.2. インタープリタ(`interpreter.rs`)
+
+このモジュールでインスタンス化された関数の実行を定義します。
+
+ローカル変数はスタックとは別の場所で管理していると書きましたが、その場所がこの`Frame`という構造です。
+後に定義する`Interpreter`という構造の中でこのフレームをスタックとして積み上げていきます。
+関数呼び出しを行うごとにスタックにフレームをプッシュし、関数を抜けるときにポップします。
+
+```rust
+use std::rc::Rc;
+
+use crate::{
+    execution::*,
+    structure::{self, *},
+};
+
+#[derive(Debug, Default)]
+pub struct Frame {
+    locals: Vec<Val>,
+    #[allow(dead_code)]
+    module: Option<Rc<ModuleInst>>,
+}
+```
+
+前に説明したとおり`block`, `loop`, `if`は内側から番号が振られ、ブランチ命令によって指定した場所へジャンプすることができます。
+今回のインタープリタでは`block`, `loop`, `if`のStructured InstructionはRustの関数として呼び出します。
+例えば`br 0`なら今呼び出されている関数を早期リターン(`block`の場合)したり、continue(`loop`の場合)したりする必要があります。
+`br 1`なら今呼び出されている関数の呼び出し元の関数へすぐに戻らなければなりません。
+
+このような早期リターンを実現する際に便利なのがRustの[std::ops::ControlFlow](https://doc.rust-lang.org/std/ops/enum.ControlFlow.html)です。
+今回は`Branch`と`Return`を区別する必要があるので、下記のような型を自作して使用します。
+
+```rust
+#[derive(Debug)]
+enum Flow {
+    Branch { relative_depth: usize },
+    Return,
+    Continue,
+}
+```
+
+```rust
+#[derive(Debug, Default)]
+pub struct Interpreter {
+    pub stack: Vec<Val>,
+}
+
+impl Interpreter {
+    fn pop_i32(&mut self) -> i32 {
+        let Some(Val::Num(Num::I32(i))) = self.stack.pop() else {
+            unreachable!()
+        };
+        i
+    }
+}
+```
+
+[Function Calls](https://webassembly.github.io/spec/core/exec/instructions.html#function-calls)に関数呼び出しの方法について書かれています。
+新しい`Frame`を作りパラメータとローカル変数を設定し、`block`の実行に置き換えています。
+
+
+```rust
+impl Interpreter {
+    // [Function Calls](https://webassembly.github.io/spec/core/exec/instructions.html#function-calls)
+    pub fn invoke(
+        &mut self,
+        store: &mut Store,
+        frame: &mut Frame,
+        funcaddr: &Addr,
+    ) -> Result<(), Trap> {
+        match store.funcs[*funcaddr].clone() {
+            FuncInst::Wasm {
+                type_,
+                module,
+                code,
+            } => self.invoke_wasm(store, frame, type_, module, code),
+        }
+    }
+
+    fn invoke_wasm(
+        &mut self,
+        store: &mut Store,
+        _frame: &mut Frame,
+        type_: FuncType,
+        module: Rc<ModuleInst>,
+        code: Rc<Func>,
+    ) -> Result<(), Trap> {
+        // pop parameters from the stack
+        let args = (0..type_.input.len())
+            .map(|_| self.stack.pop().unwrap())
+            .collect::<Vec<_>>();
+
+        // parameters & locals
+        let locals = args
+            .into_iter()
+            .rev()
+            .chain(code.locals.iter().map(|valtype| valtype.default_val()))
+            .collect();
+
+        let mut new_frame = Frame {
+            locals,
+            module: Some(module),
+        };
+
+        self.block(store, &mut new_frame, &code.body)?;
+
+        Ok(())
+    }
+```
+
+`block`の実行は`self.instr()`というメソッドで1命令ずつ実行をしていきます。
+`self.instr()`が`Flow::Branch`を返したときにどう処理しているかに注目してください。
+
+WebAssemblyの仕様で未だによくわかっていないのが、`block`や`loop`を抜けるときにスタックから余分な値を削除するのか？という点です。
+検証のときはスタックに余分な値が残っていた場合エラーとします。
+
+しかし、仕様の[Exiting instr* with label L](https://webassembly.github.io/spec/core/exec/instructions.html#exiting-xref-syntax-instructions-syntax-instr-mathit-instr-ast-with-label-l)を見ると
+`label_n {instr*} val* end -> val*`と書かれており、スタックにに余分な値が残っていてもそのままにしているように思えます。
+
+```rust
+    fn block(&mut self, store: &mut Store, frame: &mut Frame, expr: &Expr) -> Result<Flow, Trap> {
+        for instr in expr {
+            match self.instr(store, frame, instr)? {
+                Flow::Branch { relative_depth } => {
+                    if relative_depth != 0 {
+                        return Ok(Flow::Branch {
+                            relative_depth: relative_depth - 1,
+                        });
+                    }
+                    break;
+                }
+                Flow::Return => return Ok(Flow::Return),
+                Flow::Continue => (),
+            }
+        }
+        Ok(Flow::Continue)
+    }
+```
+
+`loop`も`block`とほぼ同じですが、ブランチ命令のジャンプ先がループだった場合にそのループの先頭に戻る(`continue 'outer;`)ようにします。
+
+```rust
+    fn loop_(&mut self, store: &mut Store, frame: &mut Frame, expr: &Expr) -> Result<Flow, Trap> {
+        'outer: loop {
+            for instr in expr {
+                match self.instr(store, frame, instr)? {
+                    Flow::Branch { relative_depth } => {
+                        if relative_depth != 0 {
+                            return Ok(Flow::Branch {
+                                relative_depth: relative_depth - 1,
+                            });
+                        }
+                        continue 'outer;
+                    }
+                    Flow::Return => return Ok(Flow::Return),
+                    Flow::Continue => (),
+                }
+            }
+            break;
+        }
+        Ok(Flow::Continue)
+    }
+```
+
+最後に各命令を処理するメソッドを定義します。
+
+```rust
+    fn instr(&mut self, store: &mut Store, frame: &mut Frame, instr: &Instr) -> Result<Flow, Trap> {
+        use Instr::*;
+
+        match instr {
+            Block { expr, .. } => self.block(store, frame, expr),
+            Loop { expr, .. } => self.loop_(store, frame, expr),
+            If {
+                true_branch,
+                false_branch,
+                ..
+            } => {
+                let cond = self.pop_i32();
+                if cond != 0 {
+                    self.block(store, frame, true_branch)
+                } else {
+                    self.block(store, frame, false_branch)
+                }
+            }
+            Br { labelidx } => Ok(Flow::Branch {
+                relative_depth: *labelidx as usize,
+            }),
+            BrIf { labelidx } => {
+                let cond = self.pop_i32();
+                if cond != 0 {
+                    Ok(Flow::Branch {
+                        relative_depth: *labelidx as usize,
+                    })
+                } else {
+                    Ok(Flow::Continue)
+                }
+            }
+            Return => Ok(Flow::Return),
+            I32Const { val } => {
+                self.stack.push(Val::Num(Num::I32(*val)));
+                Ok(Flow::Continue)
+            }
+            IBinOp { bit, op } => {
+                match bit {
+                    Bit::B32 => {
+                        let b = self.pop_i32();
+                        let a = self.pop_i32();
+                        match op {
+                            structure::IBinOp::Add => self.stack.push(Val::Num(Num::I32(a + b))),
+                        }
+                    }
+                    _ => unimplemented!(),
+                };
+                Ok(Flow::Continue)
+            }
+            IRelOp { bit, op } => {
+                match bit {
+                    Bit::B32 => {
+                        let b = self.pop_i32();
+                        let a = self.pop_i32();
+                        match op {
+                            structure::IRelOp::Eq => {
+                                self.stack.push(Val::Num(Num::I32((a == b) as i32)))
+                            }
+                            structure::IRelOp::Le { sign: _ } => {
+                                self.stack.push(Val::Num(Num::I32((a <= b) as i32)))
+                            }
+                        }
+                    }
+                    _ => unimplemented!(),
+                };
+                Ok(Flow::Continue)
+            }
+            LocalGet { localidx } => {
+                self.stack.push(frame.locals[*localidx as usize]);
+                Ok(Flow::Continue)
+            }
+            LocalSet { localidx } => {
+                let val = self.stack.pop().unwrap();
+                frame.locals[*localidx as usize] = val;
+                Ok(Flow::Continue)
+            }
+        }
+    }
+}
+```
+
+### 5. ホスト環境への埋め込み
+
+```shell
+lvs7k@wsl2:~/wasmpl-rs$ tree --gitignore
+.
+├── Cargo.toml
+├── example
+│   └── fibonacci.wat
+└── src
+    ├── binary.rs
+    ├── embedding.rs # これを作ります
+    ├── execution.rs
+    ├── interpreter.rs
+    ├── lib.rs
+    ├── main.rs
+    ├── structure.rs
+    ├── validation
+    │   └── func.rs
+    └── validation.rs
+```
+
+WebAssemblyの実装をホスト環境にどう埋め込むかについて、仕様のAppendixの[Embedding](https://webassembly.github.io/spec/core/appendix/embedding.html)に書かれています。
+これと[Invocation](https://webassembly.github.io/spec/core/exec/modules.html#invocation)を読みながら、
+インスタンス化したモジュールからエクスポートされた関数を取得し呼び出すコードを書いていきます。
+
+```rust
+use std::error;
+
+use crate::{
+    execution::*,
+    interpreter::{Frame, Interpreter},
+    structure::FuncType,
+};
+
+pub fn get_export_funcaddr(
+    moduleinst: &ModuleInst,
+    name: &str,
+) -> Result<Addr, Box<dyn error::Error>> {
+    for exportinst in &moduleinst.exports {
+        if exportinst.name == name {
+            match exportinst.value {
+                ExternVal::Func(addr) => return Ok(addr),
+                _ => break,
+            };
+        }
+    }
+    Err(format!("export name '{}' not found", name).into())
+}
+
+// [Invocation](https://webassembly.github.io/spec/core/exec/modules.html#invocation)
+pub fn func_invoke(
+    store: &mut Store,
+    funcaddr: &Addr,
+    vals: &[Val],
+) -> Result<Vec<Val>, Box<dyn error::Error>> {
+    let funcinst = store.funcs[*funcaddr].clone();
+    let functype = match &funcinst {
+        FuncInst::Wasm { type_, .. } => type_.clone(),
+    };
+
+    if vals.len() != functype.input.len() {
+        return Err("provided argument number is different from expected".into());
+    }
+
+    for (provided, &expected) in vals.iter().map(Val::valtype).zip(functype.input.iter()) {
+        if provided != expected {
+            return Err("provided argument type is different from expected".into());
+        }
+    }
+
+    match &funcinst {
+        FuncInst::Wasm { .. } => func_invoke_wasm(store, funcaddr, &functype, vals),
+    }
+}
+
+fn func_invoke_wasm(
+    store: &mut Store,
+    funcaddr: &Addr,
+    functype: &FuncType,
+    vals: &[Val],
+) -> Result<Vec<Val>, Box<dyn error::Error>> {
+    let mut interpreter = Interpreter::default();
+    let mut dummy_frame = Frame::default();
+
+    interpreter.stack.append(&mut vals.to_owned());
+
+    interpreter
+        .invoke(store, &mut dummy_frame, funcaddr)
+        .map_err(|_| "invoke error")?;
+
+    let mut result = (0..functype.output.len())
+        .map(|_| interpreter.stack.pop().unwrap())
+        .collect::<Vec<_>>();
+
+    result.reverse();
+
+    Ok(result)
+}
+```
+
+### 6. 実際に動かしてみよう(`main.rs`)
+
+```shell
+lvs7k@wsl2:~/wasmpl-rs$ tree --gitignore
+.
+├── Cargo.toml
+├── example
+│   └── fibonacci.wat
+└── src
+    ├── binary.rs
+    ├── embedding.rs
+    ├── execution.rs
+    ├── interpreter.rs
+    ├── lib.rs
+    ├── main.rs # これを作ります
+    ├── structure.rs
+    ├── validation
+    │   └── func.rs
+    └── validation.rs
+```
+
+汚いコードですが、16番目のフィボナッチ数列(987)が計算できるかやってみましょう。
+
+```rust
+use std::{
+    env,
+    fs::File,
+    io::{self, BufReader},
+};
+
+use wasmpl_rs::{
+    binary::Parser,
+    embedding,
+    execution::{self, Num, Store, Val},
+    validation,
+};
+
+fn main() -> io::Result<()> {
+    let mut args = env::args();
+    if args.len() != 2 {
+        println!("usage: cargo run <path of wasm>");
+        return Ok(());
+    }
+
+    let wasm = BufReader::new(File::open(args.nth(1).unwrap())?);
+    let mut parser = Parser::new(wasm);
+
+    let module = match parser.module() {
+        Ok(module) => module,
+        Err(e) => {
+            println!("{:?}", e);
+            println!("{:?}", parser);
+            return Ok(());
+        }
+    };
+
+    assert!(validation::validate_module(&module).is_some());
+
+    let mut store = Store::default();
+    let moduleinst = match execution::instantiate(&mut store, &module) {
+        Ok(moduleinst) => moduleinst,
+        Err(e) => {
+            println!("{:?}", e);
+            return Ok(());
+        }
+    };
+
+    let funcaddr = embedding::get_export_funcaddr(&moduleinst, "fibonacci").unwrap();
+
+    let result = embedding::func_invoke(&mut store, &funcaddr, &[Val::Num(Num::I32(16))]).unwrap();
+
+    dbg!(&result);
+
+    Ok(())
+}
+```
+
+ちゃんと987が計算できました🎉
+
+```shell
+lvs7k@wsl2:~/wasmpl-rs$ cargo run example/fibonacci.wasm
+   Compiling wasmpl-rs v0.1.0 (/home/lvs7k/wasmpl-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.63s
+     Running `target/debug/wasmpl-rs example/fibonacci.wasm`
+[src/main.rs:48:5] &result = [
+    Num(
+        I32(
+            987,
+        ),
+    ),
+]
+```
+
+## おわりに
+
+今までこのような長い仕様を読んで実装する経験がなかったので、たったこれだけの内容ですがものすごく大変でした。
+でも`wasm`の検証と実行についてなんとなくイメージをつかむことができました。
+
+今わかっていなくて知りたいのは「どうやって標準出力に値を出力するのか？（hello, world!がしたい）」ということです。
+機会があれば次はWebAssembly System Interface(WASI)について学びたいです。
