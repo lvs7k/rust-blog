@@ -2,10 +2,13 @@
 
 **目次**
 - はじめに
-  - 目標
 - '1. テキスト形式とバイナリ形式
   - '1.1. サンプルプログラム
   - '1.2. 知っておきたいこと
+- '2. 構文木の定義と構文解析
+  - '2.1. モジュール構成
+  - '2.2. 構文木の定義
+  - '2.3. 構文解析
 - おわりに
 
 ## はじめに
@@ -345,3 +348,876 @@ instr ::= ...
       )
     )
 ```
+
+### 2. 構文木の定義と構文解析
+
+#### 2.1. モジュール構成
+
+今回のランタイムではバイナリ形式を構文解析して構文木の形にして、木をたどりながら命令を実行していくシンプルなものとします。
+分かりやすさを重視するため、なるべく[WebAssembly Specification](https://webassembly.github.io/spec/core/)とソースコードを対応させていきます。
+
+モジュール構成は下記のようにします。
+この章では構文木の定義(`structure.rs`)とバイナリ形式の解析(`binary.rs`)を実装していきます。
+
+```shell
+lvs7k@wsl2:~/wasmpl-rs$ tree --gitignore
+.
+├── Cargo.toml
+├── example
+│   └── fibonacci.wat
+└── src
+    ├── binary.rs      # まず、これと
+    ├── embedding.rs
+    ├── execution.rs
+    ├── interpreter.rs
+    ├── lib.rs
+    ├── main.rs
+    ├── structure.rs   # これを作っていきます
+    ├── validation
+    │   └── func.rs
+    └── validation.rs
+```
+
+#### 2.2. 構文木の定義(`structure.rs`)
+
+サンプルプログラムを実行するのに必要な部分だけ定義します。
+
+##### [Types](https://webassembly.github.io/spec/core/syntax/types.html)
+
+```rust
+// Types
+
+use std::rc::Rc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumType {
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValType {
+    Num(NumType),
+}
+
+pub type ResultType = Vec<ValType>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncType {
+    pub input: ResultType,
+    pub output: ResultType,
+}
+```
+
+##### [Instructions](https://webassembly.github.io/spec/core/syntax/instructions.html)
+
+```rust
+// Instructions
+
+#[derive(Debug)]
+pub enum Instr {
+    // Control Instructions
+    Block {
+        blocktype: BlockType,
+        expr: Expr,
+    },
+    Loop {
+        blocktype: BlockType,
+        expr: Expr,
+    },
+    If {
+        blocktype: BlockType,
+        true_branch: Expr,
+        false_branch: Expr,
+    },
+    Br {
+        labelidx: Idx,
+    },
+    BrIf {
+        labelidx: Idx,
+    },
+    Return,
+
+    // Numeric Instructions
+    I32Const {
+        val: i32,
+    },
+    IBinOp {
+        bit: Bit,
+        op: IBinOp,
+    },
+    IRelOp {
+        bit: Bit,
+        op: IRelOp,
+    },
+
+    // Varable Instructions
+    LocalGet {
+        localidx: Idx,
+    },
+    LocalSet {
+        localidx: Idx,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockType {
+    Empty,
+    Idx(Idx),
+    Val(ValType),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bit {
+    B32,
+    B64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sign {
+    Signed,
+    Unsigned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IBinOp {
+    Add,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IRelOp {
+    Eq,
+    Le { sign: Sign },
+}
+
+pub type Expr = Vec<Instr>;
+```
+
+##### [Modules](https://webassembly.github.io/spec/core/syntax/modules.html)
+
+```rust
+// Modules
+
+#[derive(Debug)]
+pub struct Module {
+    pub types: Vec<FuncType>,
+    pub funcs: Vec<Rc<Func>>,
+    pub exports: Vec<Export>,
+}
+
+pub type Idx = u32;
+
+#[derive(Debug)]
+pub struct Func {
+    pub type_: Idx,
+    pub locals: Vec<ValType>,
+    pub body: Expr,
+}
+
+#[derive(Debug)]
+pub struct Export {
+    pub name: String,
+    pub desc: ExportDesc,
+}
+
+#[derive(Debug)]
+pub enum ExportDesc {
+    Func(Idx),
+}
+```
+
+#### 2.3. 構文解析(`binary.rs`)
+
+##### Parser型
+
+構文解析には`nom`などのパーサコンビネータライブラリを使っても良いですが、WebAssemblyのバイナリ形式はシンプルなので今回は自分で書いてみます。
+
+```rust
+use std::{
+    io::{Read, Seek, SeekFrom},
+    rc::Rc,
+};
+
+use crate::structure::*;
+
+#[derive(Debug)]
+pub struct Parser<R> {
+    pub reader: R,
+}
+```
+
+構文解析に失敗したときのエラー型を下記のように定義します。
+
+```rust
+#[derive(Debug)]
+pub enum ParseError {
+    Io(std::io::Error),
+    Utf8(std::str::Utf8Error),
+    Backtrack,
+    Malformed,
+}
+
+impl From<std::io::Error> for ParseError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<std::str::Utf8Error> for ParseError {
+    fn from(value: std::str::Utf8Error) -> Self {
+        Self::Utf8(value)
+    }
+}
+```
+
+WebAssemblyのバイナリ形式の解析には1バイトの先読み(`peek`)ができると便利です。
+先読みにはいろいろな方法があると思います。
+
+- `Parser`に`peeked: Option<u8>`のようなフィールドを用意する
+- `BufRead`トレイトを利用する
+- `Seek`トレイトを利用する
+
+`Seek`トレイトを使ったことがなかったので、今回は`R: Read + Seek`として解析を進めてみようと思います。
+まずは解析を進めるのに便利なメソッドから定義していきます。
+
+```rust
+impl<R: Read + Seek> Parser<R> {
+    pub fn new(reader: R) -> Self {
+        Self { reader }
+    }
+
+    pub fn byte(&mut self) -> Result<u8, ParseError> {
+        let mut buf = [0; 1];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    pub fn peek(&mut self) -> Result<u8, ParseError> {
+        let b = self.byte()?;
+        self.reader.seek(SeekFrom::Current(-1))?;
+        Ok(b)
+    }
+
+    pub fn consume(&mut self, byte: u8) -> Result<(), ParseError> {
+        if self.byte()? != byte {
+            return Err(ParseError::Malformed);
+        }
+        Ok(())
+    }
+```
+
+バイナリをあるパターンで解析しようとして失敗したらまた別のパターンでの解析をしたいことがあります。
+また、失敗しても別のパターンでの解析を試さずそのままエラーを報告したいときもあります。
+パーサが`Backtrack`というエラーを返した場合は、`Seek`で解析の開始地点まで巻き戻します。
+
+```rust
+    pub fn opt<T>(
+        &mut self,
+        mut parser: impl FnMut(&mut Parser<R>) -> Result<T, ParseError>,
+    ) -> Result<Option<T>, ParseError> {
+        let start_pos = self.reader.stream_position()?;
+        match parser(self) {
+            Ok(t) => Ok(Some(t)),
+            Err(ParseError::Backtrack) => {
+                self.reader.seek(SeekFrom::Start(start_pos))?;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+```
+
+[Vectors](https://webassembly.github.io/spec/core/binary/conventions.html#vectors)に`vec(B) ::= n:u32 (x:B)^n => x^n`と書かれています。
+最初に`u32`がLEB128形式でエンコードされていて、その数値分だけ`B`が続きます。
+
+```rust
+    pub fn vec<T>(
+        &mut self,
+        mut parser: impl FnMut(&mut Parser<R>) -> Result<T, ParseError>,
+    ) -> Result<Vec<T>, ParseError> {
+        let n = self.u32()?;
+        (0..n).map(|_| parser(self)).collect()
+    }
+```
+
+`vec`と似たようなパターンで、最初にバイト数(`u32`)があって次にそのバイト数分だけ何かが続くパターンがあります。
+`u32`を解析したあと引数のパーサを実行し、サイズが合っていなければエラーとします。
+
+```rust
+    pub fn size_prefixed<T>(
+        &mut self,
+        mut parser: impl FnMut(&mut Parser<R>) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        let size = self.u32()?;
+
+        let start_pos = self.reader.stream_position()?;
+        let ret = parser(self)?;
+
+        if self.reader.stream_position()? - start_pos != size as u64 {
+            return Err(ParseError::Malformed);
+        }
+
+        Ok(ret)
+    }
+```
+
+##### [Values](https://webassembly.github.io/spec/core/binary/values.html)
+
+WebAssemblyにおいては整数はLEB128という形式でバイナリにエンコードされています。
+[WikipediaのLEB128の記事が難しすぎる](https://github.com/lvs7k/rust-blog/blob/main/posts/wikipedia-leb128-is-too-difficult.md)という記事を書いたので、参考に実装します。
+記事を書いたあとに他の人が書いたもっと綺麗なコードを見たので、それを参考にしています。
+
+```rust
+    // Value
+
+    // LEB128: https://en.wikipedia.org/wiki/LEB128
+    pub fn u32(&mut self) -> Result<u32, ParseError> {
+        let bit = std::mem::size_of::<u32>() * 8;
+        let mut result = 0;
+        let mut shift = 0;
+        let mut buf;
+
+        loop {
+            buf = self.byte()?;
+
+            let b = (buf & 0b01111111) as u32;
+
+            if (shift >= bit - (bit % 7)) && (b >= (1 << (bit % 7))) {
+                return Err(ParseError::Malformed);
+            }
+
+            result |= b << shift;
+            shift += 7;
+
+            if buf & 0b10000000 == 0 {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn i32(&mut self) -> Result<i32, ParseError> {
+        let bit = std::mem::size_of::<i32>() * 8;
+        let mut result = 0;
+        let mut shift = 0;
+        let mut buf;
+
+        loop {
+            buf = self.byte()?;
+
+            let b = (buf & 0b01111111) as i32;
+
+            if shift >= bit - (bit % 7) {
+                let is_positive = (b & 0b01000000) == 0;
+
+                if is_positive {
+                    if b >= (1 << (bit % 7)) {
+                        return Err(ParseError::Malformed);
+                    }
+                } else {
+                    let mask = (!0 << (bit % 7)) & 0b01111111;
+                    if b & mask != mask {
+                        return Err(ParseError::Malformed);
+                    }
+                }
+            }
+
+            result |= b << shift;
+            shift += 7;
+
+            if buf & 0b10000000 == 0 {
+                let is_negative = (b & 0b01000000) != 0;
+
+                if is_negative && shift <= bit {
+                    result |= !0 << shift;
+                }
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn f32(&mut self) -> Result<f32, ParseError> {
+        let mut buf = [0; 4];
+        self.reader.read_exact(&mut buf)?;
+        Ok(f32::from_le_bytes(buf))
+    }
+```
+
+WebAssemblyの文字列はUTF-8です。
+`std::str::from_utf8`でバイナリからRustの文字列へ変換します。
+
+```rust
+    pub fn name(&mut self) -> Result<String, ParseError> {
+        let utf8_bytes = self.vec(Self::byte)?;
+        let name = std::str::from_utf8(&utf8_bytes[..])?.to_string();
+        Ok(name)
+    }
+```
+
+##### [Types](https://webassembly.github.io/spec/core/binary/types.html)
+
+今回必要となる型はこれだけです。
+
+```rust
+    // Types
+
+    pub fn valtype(&mut self) -> Result<ValType, ParseError> {
+        Ok(match self.byte()? {
+            b'\x7f' => ValType::Num(NumType::I32),
+            b'\x7e' => ValType::Num(NumType::I64),
+            b'\x7d' => ValType::Num(NumType::F32),
+            b'\x7c' => ValType::Num(NumType::F64),
+            _ => return Err(ParseError::Malformed),
+        })
+    }
+
+    pub fn resulttype(&mut self) -> Result<ResultType, ParseError> {
+        self.vec(Self::valtype)
+    }
+
+    pub fn functype(&mut self) -> Result<FuncType, ParseError> {
+        self.consume(b'\x60')?;
+        Ok(FuncType {
+            input: self.vec(Self::valtype)?,
+            output: self.vec(Self::valtype)?,
+        })
+    }
+```
+
+##### [Instructions](https://webassembly.github.io/spec/core/binary/instructions.html)
+
+`if`の構文解析が`false`だった場合の部分がある場合とない場合があり、少し難しいです。
+`instrs`というメソッドを用意して、それを使って`if`を解析しています。
+
+```rust
+    // Instructions
+
+    pub fn blocktype(&mut self) -> Result<BlockType, ParseError> {
+        let start_pos = self.reader.stream_position()?;
+
+        if self.byte()? == b'\x40' {
+            return Ok(BlockType::Empty);
+        }
+
+        self.reader.seek(SeekFrom::Start(start_pos))?;
+        if let Ok(valtype) = self.valtype() {
+            return Ok(BlockType::Val(valtype));
+        }
+
+        self.reader.seek(SeekFrom::Start(start_pos))?;
+        if let Ok(x) = self.i32() {
+            return Ok(BlockType::Idx(u32::try_from(x).unwrap()));
+        }
+
+        Err(ParseError::Malformed)
+    }
+
+    pub fn instr(&mut self) -> Result<Instr, ParseError> {
+        Ok(match self.byte()? {
+            // Control Instructions
+            b'\x02' => Instr::Block {
+                blocktype: self.blocktype()?,
+                expr: self.expr()?,
+            },
+            b'\x03' => Instr::Loop {
+                blocktype: self.blocktype()?,
+                expr: self.expr()?,
+            },
+            b'\x04' => {
+                let blocktype = self.blocktype()?;
+                let true_branch = self.instrs()?;
+                match self.byte()? {
+                    b'\x05' => Instr::If {
+                        blocktype,
+                        true_branch,
+                        false_branch: self.expr()?,
+                    },
+                    b'\x0b' => Instr::If {
+                        blocktype,
+                        true_branch,
+                        false_branch: Vec::new(),
+                    },
+                    _ => return Err(ParseError::Malformed),
+                }
+            }
+            b'\x0c' => Instr::Br {
+                labelidx: self.u32()?,
+            },
+            b'\x0d' => Instr::BrIf {
+                labelidx: self.u32()?,
+            },
+            b'\x0f' => Instr::Return,
+
+            // Variable Instructions
+            b'\x20' => Instr::LocalGet {
+                localidx: self.u32()?,
+            },
+            b'\x21' => Instr::LocalSet {
+                localidx: self.u32()?,
+            },
+
+            // Numeric Instructions
+            b'\x46' => Instr::IRelOp {
+                bit: Bit::B32,
+                op: IRelOp::Eq,
+            },
+            b'\x4c' => Instr::IRelOp {
+                bit: Bit::B32,
+                op: IRelOp::Le { sign: Sign::Signed },
+            },
+            b'\x41' => Instr::I32Const { val: self.i32()? },
+            b'\x6a' => Instr::IBinOp {
+                bit: Bit::B32,
+                op: IBinOp::Add,
+            },
+
+            _ => unimplemented!(),
+        })
+    }
+
+    fn instrs(&mut self) -> Result<Vec<Instr>, ParseError> {
+        let mut res = Vec::new();
+
+        loop {
+            res.push(self.instr()?);
+            let next_byte = self.peek()?;
+            if next_byte == b'\x05' || next_byte == b'\x0b' {
+                break;
+            }
+        }
+
+        Ok(res)
+    }
+
+    pub fn expr(&mut self) -> Result<Expr, ParseError> {
+        let instrs = self.instrs()?;
+        self.consume(b'\x0b')?;
+        Ok(instrs)
+    }
+```
+
+##### [Modules](https://webassembly.github.io/spec/core/binary/modules.html)
+
+Indexは多くの種類があり別々の型に分けても良いですが、今回はそこまでする必要がないと思ったので共通の`Idx`という型にしました。
+
+また、各セクションを解析するのに便利な`section`メソッドを用意します。
+仕様に`section_N(B) ::= N:byte size:u32 cont:B`と書かれています。
+最初にセクションのIDが1バイト、次にセクションのバイト数、最後にそのバイト数だけセクションのコンテンツがあります。
+コンテンツの大きさが`size:u32`と合っていなければエラーです。
+
+```rust
+    // Modules
+
+    pub fn idx(&mut self) -> Result<Idx, ParseError> {
+        self.u32()
+    }
+
+    fn section<T>(
+        &mut self,
+        section_id: u8,
+        parser: impl FnMut(&mut Parser<R>) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        self.consume(section_id)
+            .map_err(|_| ParseError::Backtrack)?;
+        self.size_prefixed(parser)
+    }
+```
+
+次に各セクションを仕様に従って解析していきます。
+Custom sectionというセクションがありますが、今回のプログラム実行には関係ないので読み飛ばします。
+
+```rust
+    pub fn customsec(&mut self) -> Result<(), ParseError> {
+        self.consume(b'\x00').map_err(|_| ParseError::Backtrack)?;
+        let size = self.u32()?;
+
+        let start_pos = self.reader.stream_position()?;
+        let _name = self.name()?;
+
+        // skip bytes
+        let remain = start_pos + size as u64 - self.reader.stream_position()?;
+        for _ in 0..remain {
+            self.byte()?;
+        }
+
+        Ok(())
+    }
+
+    pub fn typesec(&mut self) -> Result<Vec<FuncType>, ParseError> {
+        self.section(b'\x01', |parser| parser.vec(Self::functype))
+    }
+
+    pub fn funcsec(&mut self) -> Result<Vec<Idx>, ParseError> {
+        self.section(b'\x03', |parser| parser.vec(Self::idx))
+    }
+
+    pub fn exportsec(&mut self) -> Result<Vec<Export>, ParseError> {
+        self.section(b'\x07', |parser| parser.vec(Self::export))
+    }
+
+    fn export(&mut self) -> Result<Export, ParseError> {
+        Ok(Export {
+            name: self.name()?,
+            desc: self.exportdesc()?,
+        })
+    }
+
+    fn exportdesc(&mut self) -> Result<ExportDesc, ParseError> {
+        Ok(match self.byte()? {
+            b'\x00' => ExportDesc::Func(self.idx()?),
+            _ => unimplemented!(),
+        })
+    }
+
+    pub fn codesec(&mut self) -> Result<Vec<(Vec<ValType>, Expr)>, ParseError> {
+        self.section(b'\x0a', |parser| parser.vec(Self::code))
+    }
+
+    fn code(&mut self) -> Result<(Vec<ValType>, Expr), ParseError> {
+        self.size_prefixed(Self::func)
+    }
+
+    fn func(&mut self) -> Result<(Vec<ValType>, Expr), ParseError> {
+        Ok((
+            self.vec(Self::locals)?.into_iter().flatten().collect(),
+            self.expr()?,
+        ))
+    }
+
+    fn locals(&mut self) -> Result<Vec<ValType>, ParseError> {
+        let n = self.u32()?;
+        let t = self.valtype()?;
+        Ok(vec![t; n as usize])
+    }
+```
+
+最後に`Module`という構文木を作り上げて完成です🎉
+
+バイナリ形式の最初にマジックナンバーとバージョンがありますが、その後の各セクションは一つもない可能性があります。
+用意した`opt`というメソッドを使って各セクションを解析していきます。
+
+```rust
+    pub fn module(&mut self) -> Result<Module, ParseError> {
+        self.magic()?;
+        self.version()?;
+
+        self.opt(Self::customsec)?;
+        let types = self.opt(Self::typesec)?.unwrap_or_default();
+        self.opt(Self::customsec)?;
+        let typeidxs = self.opt(Self::funcsec)?.unwrap_or_default();
+        self.opt(Self::customsec)?;
+        let exports = self.opt(Self::exportsec)?.unwrap_or_default();
+        self.opt(Self::customsec)?;
+        let codes = self.opt(Self::codesec)?.unwrap_or_default();
+        self.opt(Self::customsec)?;
+
+        assert_eq!(typeidxs.len(), codes.len());
+
+        let funcs = typeidxs
+            .into_iter()
+            .zip(codes)
+            .map(|(type_, (locals, body))| {
+                Rc::new(Func {
+                    type_,
+                    locals,
+                    body,
+                })
+            })
+            .collect();
+
+        Ok(Module {
+            types,
+            funcs,
+            exports,
+        })
+    }
+
+    fn magic(&mut self) -> Result<(), ParseError> {
+        let magic = b"\x00\x61\x73\x6d";
+        for b in magic {
+            if *b != self.byte()? {
+                return Err(ParseError::Malformed);
+            }
+        }
+        Ok(())
+    }
+
+    fn version(&mut self) -> Result<(), ParseError> {
+        let magic = b"\x01\x00\x00\x00";
+        for b in magic {
+            if *b != self.byte()? {
+                return Err(ParseError::Malformed);
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+実際にサンプルプログラムを構文解析した`Module`をデバッグ表示すると下記のようになります。
+長いので折りたたんでいます。
+
+<details>
+<summary>Moduleのデバッグ表示</summary>
+  
+```shell
+[src/main.rs:33:5] &module = Module {
+    types: [
+        FuncType {
+            input: [
+                Num(
+                    I32,
+                ),
+            ],
+            output: [
+                Num(
+                    I32,
+                ),
+            ],
+        },
+    ],
+    funcs: [
+        Func {
+            type_: 0,
+            locals: [
+                Num(
+                    I32,
+                ),
+                Num(
+                    I32,
+                ),
+                Num(
+                    I32,
+                ),
+            ],
+            body: [
+                LocalGet {
+                    localidx: 0,
+                },
+                I32Const {
+                    val: 0,
+                },
+                IRelOp {
+                    bit: B32,
+                    op: Le {
+                        sign: Signed,
+                    },
+                },
+                If {
+                    blocktype: Empty,
+                    true_branch: [
+                        I32Const {
+                            val: 0,
+                        },
+                        Return,
+                    ],
+                    false_branch: [],
+                },
+                I32Const {
+                    val: 0,
+                },
+                LocalSet {
+                    localidx: 1,
+                },
+                I32Const {
+                    val: 1,
+                },
+                LocalSet {
+                    localidx: 2,
+                },
+                I32Const {
+                    val: 1,
+                },
+                LocalSet {
+                    localidx: 3,
+                },
+                Block {
+                    blocktype: Val(
+                        Num(
+                            I32,
+                        ),
+                    ),
+                    expr: [
+                        Block {
+                            blocktype: Empty,
+                            expr: [
+                                Loop {
+                                    blocktype: Empty,
+                                    expr: [
+                                        LocalGet {
+                                            localidx: 3,
+                                        },
+                                        LocalGet {
+                                            localidx: 0,
+                                        },
+                                        IRelOp {
+                                            bit: B32,
+                                            op: Eq,
+                                        },
+                                        BrIf {
+                                            labelidx: 1,
+                                        },
+                                        LocalGet {
+                                            localidx: 2,
+                                        },
+                                        LocalGet {
+                                            localidx: 1,
+                                        },
+                                        LocalGet {
+                                            localidx: 2,
+                                        },
+                                        IBinOp {
+                                            bit: B32,
+                                            op: Add,
+                                        },
+                                        LocalSet {
+                                            localidx: 2,
+                                        },
+                                        LocalSet {
+                                            localidx: 1,
+                                        },
+                                        LocalGet {
+                                            localidx: 3,
+                                        },
+                                        I32Const {
+                                            val: 1,
+                                        },
+                                        IBinOp {
+                                            bit: B32,
+                                            op: Add,
+                                        },
+                                        LocalSet {
+                                            localidx: 3,
+                                        },
+                                        Br {
+                                            labelidx: 0,
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                        LocalGet {
+                            localidx: 2,
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+    exports: [
+        Export {
+            name: "fibonacci",
+            desc: Func(
+                0,
+            ),
+        },
+    ],
+}
+```
+  
+</details>
