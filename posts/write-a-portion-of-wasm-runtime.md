@@ -9,6 +9,9 @@
   - '2.1. モジュール構成
   - '2.2. 構文木の定義
   - '2.3. 構文解析
+- '3. 検証
+  - '3.1. 関数以外の検証
+  - '3.2. 関数の検証
 - おわりに
 
 ## はじめに
@@ -1225,3 +1228,552 @@ Custom sectionというセクションがありますが、今回のプログラ
 ```
   
 </details>
+
+### 3. 検証
+
+関数の検証が他に比べて複雑なので、別のモジュールに分けます。
+
+```shell
+lvs7k@wsl2:~/wasmpl-rs$ tree --gitignore
+.
+├── Cargo.toml
+├── example
+│   └── fibonacci.wat
+└── src
+    ├── binary.rs
+    ├── embedding.rs
+    ├── execution.rs
+    ├── interpreter.rs
+    ├── lib.rs
+    ├── main.rs
+    ├── structure.rs
+    ├── validation
+    │   └── func.rs    # これと
+    └── validation.rs  # これを作ります
+```
+
+#### 3.1. 関数以外の検証(`validation.rs`)
+
+今回の検証のプログラムは戻り値を`Option`として検証に成功したら`Some`失敗したら`None`とします。
+これだとどこで検証でエラーになったのかわからないので、より実用的なランタイムを作る場合は`Result`を使いましょう。
+
+```rust
+pub mod func;
+
+use crate::structure::*;
+
+fn error_if(pred: bool) -> Option<()> {
+    if pred { None } else { Some(()) }
+}
+```
+
+検証には[Contexts](https://webassembly.github.io/spec/core/valid/conventions.html#contexts)という型を使用します。
+今回必要なフィールドは`types`と`funcs`のみです。この後すぐに何を設定するか説明します。
+
+前に説明した通り`block`, `loop`, `if`は`BlockType`というインプットとアウトプットの型を持ちます。
+`BlockType`には3パターンの形式があり、`get_functype`メソッドは`BlockType`を`FuncType`へ変換しています。
+`BlockType`に型のインデックスが指定されていた場合、`Context`にその型が存在するかをチェックします。
+存在しなければ`None`で検証エラーです。
+
+```rust
+#[derive(Debug, Default)]
+struct Context {
+    types: Vec<FuncType>,
+    funcs: Vec<FuncType>,
+}
+
+impl Context {
+    fn get_functype(&self, blocktype: &BlockType) -> Option<FuncType> {
+        match blocktype {
+            BlockType::Empty => Some(FuncType {
+                input: Vec::new(),
+                output: Vec::new(),
+            }),
+            BlockType::Idx(idx) => self.types.get(*idx as usize).cloned(),
+            BlockType::Val(valtype) => Some(FuncType {
+                input: Vec::new(),
+                output: vec![*valtype],
+            }),
+        }
+    }
+}
+```
+
+この`validate_module`関数が検証のメインとなる関数です。
+`Context`には`Module`の`types`と、関数の型(`FuncType`)を設定します。
+
+その後、関数とエクスポートした値を検証していきます。
+エクスポートの検証（今回は関数のみ）は、その値が`Context`に存在するかどうかチェックしているだけです。
+
+```rust
+pub fn validate_module(module: &Module) -> Option<()> {
+    let context = Context {
+        types: module.types.clone(),
+        funcs: module
+            .funcs
+            .iter()
+            .map(|func| module.types[func.type_ as usize].clone())
+            .collect(),
+    };
+
+    for func in &module.funcs {
+        func::validate_func(&context, func)?;
+    }
+
+    for export in &module.exports {
+        validate_export(&context, export)?;
+    }
+
+    Some(())
+}
+
+fn validate_export(context: &Context, export: &Export) -> Option<()> {
+    match export.desc {
+        ExportDesc::Func(idx) => {
+            context.funcs.get(idx as usize)?;
+        }
+    }
+
+    Some(())
+}
+```
+
+#### 3.2. 関数の検証(`validation/func.rs`)
+
+まず関数の検証とはどのようなことをするのかイメージをつかみましょう。
+WebAssemblyの仕様のAppendixに[Validation Algorithm](https://webassembly.github.io/spec/core/appendix/algorithm.html)というページがあり、
+親切なことに疑似コードで関数の検証のアルゴリズムについて書いてくれています。
+
+例えば下記のような関数を検証するとします。
+型を入れるスタックを用意して、各命令を実行したときのスタックの状態（型のみ）を考えていきます。
+
+```wat
+(func $hello (result i32)
+  i32.const 1 ;; stack: [i32]
+  i32.const 2 ;; stack: [i32][i32]
+  i32.add     ;; stack: [i32]
+)
+```
+
+`i32.const`を実行したらスタックに`i32`を追加します。ここで検証エラーになることはありません。
+`i32.add`を実行したら「スタックに`i32`が2つ存在すること」をチェックし、なければ検証エラーとします。
+その後、スタックに足し算の結果`i32`を追加します。
+
+スタックに追加する型は下記のように定義します。
+WebAssemblyの命令の中には`drop`や`select`のような`value-polymorphic`と呼ばれる型を問わない命令が存在します。
+`drop`はスタックから値を1つ取り出す命令ですが、`i32.add`と異なりどんな型の値がスタックに乗っていてもかまいません。
+
+これを表現するために下記のような`Any`という型を用意します。
+スタックから値を取り出す際に期待する型かどうかチェックしますが、`Any`の場合はチェックOKとなります。
+
+```rust
+use crate::structure::*;
+
+use super::{Context, error_if};
+
+#[derive(Debug, Clone, Copy)]
+enum ValTypeAny {
+    Exact(ValType),
+    Any,
+}
+
+impl PartialEq for ValTypeAny {
+    fn eq(&self, other: &Self) -> bool {
+        use ValTypeAny::*;
+        match (self, other) {
+            (Any, _) => true,
+            (_, Any) => true,
+            (Exact(a), Exact(b)) => a == b,
+        }
+    }
+}
+```
+
+疑似コードと同様に`CtrlFrame`という型を用意します。
+`block`, `loop`, `if`といったStructured Instructionはネストすることができます。
+これらの命令を実行するたびに、`CtrlFrame`を次に定義する`Validator`のスタックに追加していきます。
+
+```rust
+#[derive(Debug)]
+struct CtrlFrame {
+    is_loop: bool,
+    functype: FuncType,
+    height: usize,
+    unreachable: bool,
+}
+```
+
+`is_loop`でループかそれ以外かを判定できるようにしています。
+理由は`loop`のみブランチ命令(`br`など)の実行時のチェック内容が異なるからです。
+
+##### [Labels](https://webassembly.github.io/spec/core/exec/runtime.html#labels)について
+
+> [!WARNING]
+> 説明が下手くそなので時間があれば書き直す。
+
+ここで私が仕様を読んでいて一番理解に苦しんだ`Label`について説明します。
+Executionの[Instructions](https://webassembly.github.io/spec/core/exec/instructions.html)を見ると、`block`と`loop`に次のような式が書かれています。
+
+```
+block blocktype instr* end
+
+F; val^m block bt instr* end -> F; label_n {ε} val^m instr* end
+```
+
+これは下記のようなことを言っているのだと思います。
+
+- `block`の実行は`label`の実行に置き換えることができる
+- `label`のあとの`{ .. }`の部分は、このラベルに対してブランチ命令でジャンプした際に次に実行する処理を表す（以後、「継続」と呼びます）
+- `label`は引数(arity)を持っており、継続へのインプットの数を表す
+
+上の例では`block`内でそのブロックに対してブランチ命令でジャンプするとブロックを抜けるので、継続はなし(ε)となっています。
+そして、`block`の`blocktype`の戻り値の数は`n`なので、継続（ブロックを抜けた後の処理）へのインプットの数は`n`となります。
+要は「ブロックを抜けるときは`blocktype`の戻り値の数だけスタックに値を積まなければならない」ということです。
+
+```
+loop blocktype instr* end
+
+F; val^m loop bt instr* end -> F; label_m { loop bt instr* end } val^m instr* end
+```
+
+`block`が理解できれば`loop`も理解できるようになります。
+`loop`では`label`の引数(arity)が`block`とは異なり`blocktype`の引数の数となっています。
+`loop`内でそのループに対してブランチ命令でジャンプするとループの先頭に戻るので、継続は`{ loop bt instr* end }`となります。
+`label`の引数(arity)は継続に対するインプットの数なので、`blocktype`の引数の数になります。
+
+`CtrlFrame`に`is_loop`というフィールドを持たせているのは、`loop`だけこの`label`の引数(arity)が異なるからです。
+`if`は`block`に置き換えることができるので`block`と同じ扱いです。
+
+##### 関数の検証（続き）
+
+関数の検証には次の型を使います。
+
+
+```rust
+#[derive(Debug, Default)]
+struct Validator {
+    stack: Vec<ValTypeAny>,
+    ctrls: Vec<CtrlFrame>,
+    locals: Vec<ValType>,
+    return_: Option<ResultType>, // None if no return is allowed, as in free-standing expressions
+}
+```
+
+疑似コードを見ながら同じようなコードを実装していきます。
+
+```rust
+impl Validator {
+    fn push_val(&mut self, type_: ValTypeAny) {
+        self.stack.push(type_)
+    }
+
+    fn push_vals(&mut self, types: &[ValType]) {
+        for valtype in types {
+            self.push_val(ValTypeAny::Exact(*valtype));
+        }
+    }
+
+    fn pop_val(&mut self) -> Option<ValTypeAny> {
+        if self.stack.len() == self.current_ctrl().height && self.current_ctrl().unreachable {
+            return Some(ValTypeAny::Any);
+        }
+        error_if(self.stack.len() == self.current_ctrl().height)?;
+        self.stack.pop()
+    }
+
+    fn pop_val_exact(&mut self, expect: &ValType) -> Option<ValTypeAny> {
+        let actual = self.pop_val()?;
+        let expect = ValTypeAny::Exact(*expect);
+        error_if(actual != expect)?;
+        Some(actual)
+    }
+
+    fn pop_vals_exact(&mut self, expects: &[ValType]) -> Option<Vec<ValTypeAny>> {
+        let popped: Option<Vec<_>> = expects
+            .iter()
+            .rev()
+            .map(|valtype| self.pop_val_exact(valtype))
+            .collect();
+
+        popped.map(|mut v| {
+            v.reverse();
+            v
+        })
+    }
+
+    fn current_ctrl(&mut self) -> &mut CtrlFrame {
+        self.ctrls
+            .last_mut()
+            .expect("instructions must be executed in a frame")
+    }
+
+    fn push_ctrl(&mut self, is_loop: bool, functype: FuncType) {
+        let mut inputs = functype
+            .input
+            .iter()
+            .map(|valtype| ValTypeAny::Exact(*valtype))
+            .collect::<Vec<_>>();
+
+        self.ctrls.push(CtrlFrame {
+            is_loop,
+            functype,
+            height: self.stack.len(),
+            unreachable: false,
+        });
+
+        self.stack.append(&mut inputs);
+    }
+
+    fn pop_ctrl(&mut self) -> Option<CtrlFrame> {
+        let expects = self.current_ctrl().functype.output.clone();
+        let height = self.current_ctrl().height;
+        self.pop_vals_exact(&expects)?;
+        error_if(self.stack.len() != height)?;
+        self.ctrls.pop()
+    }
+
+    fn unreachable(&mut self) {
+        let new_len = self.current_ctrl().height;
+        assert!(
+            new_len <= self.stack.len(),
+            "do not resize the stack longer"
+        );
+        self.stack.resize(new_len, ValTypeAny::Any);
+        self.current_ctrl().unreachable = true;
+    }
+
+    fn nth_label_type(&self, n: usize) -> Option<ResultType> {
+        self.ctrls.get(self.ctrls.len() - 1 - n).map(|ctrl| {
+            if ctrl.is_loop {
+                ctrl.functype.input.clone()
+            } else {
+                ctrl.functype.output.clone()
+            }
+        })
+    }
+```
+
+重要なのは`pop_val`と`unreachable`です。
+前に次のコードがエラーにならないと書きました。
+
+```wat
+(module
+  (func $hello (result i32)
+    i32.const 1   ;; stack: [1]
+    i32.const 2   ;; stack: [1][2]
+
+    (block $break (param i32 i32) (result i32)
+      return
+    )
+  )
+)
+```
+
+仕様のValidationの[return](https://webassembly.github.io/spec/core/valid/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-return)を見ると、
+`return: [t_1* t*] -> [t_2*]`と書かれています。
+この関数の戻り値は`i32`なので、ここでの`return`は`return: [t_1* i32] -> [t_2*]`と解釈されます。
+要は「`return`の実行時にスタックのトップの値が`i32`でさえあればよい」ということです。
+
+この検証を行うために、`CtrlFrame`に`unreachable`というフラグを持たせています。
+`return`の実行後に`block`を抜けるときに、`block`の戻り値の`i32`がスタックに追加されているかどうかチェックします。
+`return`の実行時に`unreachable`フラグが立つため`pop_val`が`Any`を返し、チェックOKとなります。
+
+```rust
+    fn pop_val(&mut self) -> Option<ValTypeAny> {
+        if self.stack.len() == self.current_ctrl().height && self.current_ctrl().unreachable {
+            return Some(ValTypeAny::Any);
+        }
+        error_if(self.stack.len() == self.current_ctrl().height)?;
+        self.stack.pop()
+    }
+```
+
+疑似コードと異なり`label`を使っていないので、`block`, `loop`, `if`を検証するためのメソッドを定義します。
+検証時は`wasm`の実行時とは異なり、ブランチ命令や`return`が実行されても早期リターンしません。
+`if`も`true`と`false`の両方の場合を検証していきます。
+
+```rust
+    fn ctrl(
+        &mut self,
+        context: &Context,
+        functype: &FuncType,
+        expr: &Expr,
+        is_loop: bool,
+    ) -> Option<()> {
+        self.pop_vals_exact(&functype.input)?;
+        self.push_ctrl(is_loop, functype.clone());
+
+        for instr in expr {
+            self.instr(context, instr)?;
+        }
+
+        self.pop_ctrl()?;
+        self.push_vals(&functype.output);
+
+        Some(())
+    }
+
+    fn block(&mut self, context: &Context, blocktype: &BlockType, expr: &Expr) -> Option<()> {
+        let functype = context.get_functype(blocktype)?;
+        self.ctrl(context, &functype, expr, false)
+    }
+
+    fn loop_(&mut self, context: &Context, blocktype: &BlockType, expr: &Expr) -> Option<()> {
+        let functype = context.get_functype(blocktype)?;
+        self.ctrl(context, &functype, expr, true)
+    }
+
+    fn if_(
+        &mut self,
+        context: &Context,
+        blocktype: &BlockType,
+        true_branch: &Expr,
+        false_branch: &Expr,
+    ) -> Option<()> {
+        let functype = context.get_functype(blocktype)?;
+
+        self.pop_val_exact(&ValType::Num(NumType::I32))?;
+        self.pop_vals_exact(&functype.input)?;
+
+        // true branch
+        self.push_ctrl(false, functype.clone());
+        for instr in true_branch {
+            self.instr(context, instr)?;
+        }
+        self.pop_ctrl()?;
+
+        // false branch
+        self.push_ctrl(false, functype.clone());
+        for instr in false_branch {
+            self.instr(context, instr)?;
+        }
+        self.pop_ctrl()?;
+
+        // end
+        self.push_vals(&functype.output);
+
+        Some(())
+    }
+```
+
+各命令の検証です。
+
+```rust
+    fn instr(&mut self, context: &Context, instr: &Instr) -> Option<()> {
+        use Instr::*;
+
+        match instr {
+            Block { blocktype, expr } => self.block(context, blocktype, expr),
+            Loop { blocktype, expr } => self.loop_(context, blocktype, expr),
+            If {
+                blocktype,
+                true_branch,
+                false_branch,
+            } => self.if_(context, blocktype, true_branch, false_branch),
+            Br { labelidx } => {
+                error_if(self.ctrls.len() <= *labelidx as usize)?;
+                let label_type = self.nth_label_type(*labelidx as usize)?;
+                self.pop_vals_exact(&label_type)?;
+                self.unreachable();
+                Some(())
+            }
+            BrIf { labelidx } => {
+                error_if(self.ctrls.len() <= *labelidx as usize)?;
+                self.pop_val_exact(&ValType::Num(NumType::I32))?;
+                let label_type = self.nth_label_type(*labelidx as usize)?;
+                self.pop_vals_exact(&label_type)?;
+                self.push_vals(&label_type);
+                Some(())
+            }
+            Return => {
+                let resulttype = self.return_.clone()?;
+                self.pop_vals_exact(&resulttype)?;
+                self.unreachable();
+                Some(())
+            }
+            I32Const { .. } => {
+                self.push_val(ValTypeAny::Exact(ValType::Num(NumType::I32)));
+                Some(())
+            }
+            IBinOp { bit, .. } => {
+                match bit {
+                    Bit::B32 => {
+                        self.pop_val_exact(&ValType::Num(NumType::I32))?;
+                        self.pop_val_exact(&ValType::Num(NumType::I32))?;
+                        self.push_val(ValTypeAny::Exact(ValType::Num(NumType::I32)));
+                    }
+                    Bit::B64 => {
+                        self.pop_val_exact(&ValType::Num(NumType::I64))?;
+                        self.pop_val_exact(&ValType::Num(NumType::I64))?;
+                        self.push_val(ValTypeAny::Exact(ValType::Num(NumType::I64)));
+                    }
+                }
+                Some(())
+            }
+            IRelOp { bit, .. } => {
+                match bit {
+                    Bit::B32 => {
+                        self.pop_val_exact(&ValType::Num(NumType::I32))?;
+                        self.pop_val_exact(&ValType::Num(NumType::I32))?;
+                        self.push_val(ValTypeAny::Exact(ValType::Num(NumType::I32)));
+                    }
+                    Bit::B64 => {
+                        self.pop_val_exact(&ValType::Num(NumType::I64))?;
+                        self.pop_val_exact(&ValType::Num(NumType::I64))?;
+                        self.push_val(ValTypeAny::Exact(ValType::Num(NumType::I32)));
+                    }
+                }
+                Some(())
+            }
+            LocalGet { localidx } => {
+                let valtype = self.locals.get(*localidx as usize)?;
+                self.push_val(ValTypeAny::Exact(*valtype));
+                Some(())
+            }
+            LocalSet { localidx } => {
+                let valtype = *self.locals.get(*localidx as usize)?;
+                self.pop_val_exact(&valtype)?;
+                Some(())
+            }
+        }
+    }
+}
+```
+
+最後に親モジュール(`validation.rs`)で使用する`validate_func`関数を定義します。
+
+```rust
+pub(super) fn validate_func(context: &Context, func: &Func) -> Option<()> {
+    let functype = context.funcs[func.type_ as usize].clone();
+
+    let mut validator = Validator {
+        // parameters & locals
+        locals: functype
+            .input
+            .iter()
+            .chain(func.locals.iter())
+            .copied()
+            .collect(),
+        return_: Some(functype.output.clone()),
+        ..Default::default()
+    };
+
+    let functype = FuncType {
+        input: Vec::new(),
+        output: functype.output,
+    };
+
+    validator.ctrl(context, &functype, &func.body, false)
+}
+```
+
+ポイントは次の2つです。
+
+- `Validator`の`locals`に関数のパラメータ＆ローカル変数の型を設定する
+- インプットはなし、アウトプットは関数の戻り値と同じ、の`block`として検証を行う
+
+[Invocation of function address a](https://webassembly.github.io/spec/core/exec/instructions.html#exec-invoke)に
+`S; val^n (invoke a) -> S; frame_m {F} label_m {} instr* end end`と書かれています。
+`label`の継続が何もないので、これは関数呼び出しは`block`の実行として置き換えられることを意味しています。
+`label`の引数(arity)は関数の戻り値の数`m`となっています。
+なので関数呼び出しの検証を`block`の検証に置き換えて行っています。
